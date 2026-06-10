@@ -1,0 +1,157 @@
+services:
+  init:
+    image: python:3.11-slim
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /tmp/secrets
+        python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > /tmp/secrets/POSTGRES_PASSWORD.txt
+        python3 -c 'import secrets; print(secrets.token_urlsafe(16))' > /tmp/secrets/KEYCLOAK_ADMIN_PASSWORD.txt
+        python3 -c 'import secrets; print(secrets.token_urlsafe(16))' > /tmp/secrets/KEYCLOAK_USER_PASSWORD.txt
+        python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > /tmp/secrets/KEYCLOAK_CLIENT_SECRET.txt
+        echo 'sdmx' > /tmp/secrets/KEYCLOAK_USERNAME.txt
+        chmod 644 /tmp/secrets/*.txt
+        echo '--- Generated Credentials ---'
+        echo "Postgres password: $(cat /tmp/secrets/POSTGRES_PASSWORD.txt)"
+        echo "Keycloak admin password: $(cat /tmp/secrets/KEYCLOAK_ADMIN_PASSWORD.txt)"
+        echo "Keycloak user (sdmx) password: $(cat /tmp/secrets/KEYCLOAK_USER_PASSWORD.txt)"
+        echo "Keycloak client secret: $(cat /tmp/secrets/KEYCLOAK_CLIENT_SECRET.txt)"
+        echo '-----------------------------'
+    volumes:
+      - secrets_tmp:/tmp/secrets
+    networks:
+      - sdmx-network
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sdmx-postgres
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: sdmxuser
+      POSTGRES_DB: sdmxdb
+      POSTGRES_PASSWORD_FILE: /tmp/secrets/POSTGRES_PASSWORD.txt
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - secrets_tmp:/tmp/secrets
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sdmxuser -d sdmxdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - sdmx-network
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.3
+    user: "0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export KC_BOOTSTRAP_ADMIN_USERNAME=admin
+        export KC_BOOTSTRAP_ADMIN_PASSWORD=$$(cat /tmp/secrets/KEYCLOAK_ADMIN_PASSWORD.txt)
+        KEYCLOAK_USER_PASSWORD=$$(cat /tmp/secrets/KEYCLOAK_USER_PASSWORD.txt)
+        KEYCLOAK_CLIENT_SECRET=$$(cat /tmp/secrets/KEYCLOAK_CLIENT_SECRET.txt)
+        # Clear H2 database so realm is always imported fresh with new credentials
+        rm -rf /opt/keycloak/data/h2
+        mkdir -p /opt/keycloak/data/import
+        sed -e "s|__KEYCLOAK_USER_PASSWORD__|$${KEYCLOAK_USER_PASSWORD}|g" \
+            -e "s|__KEYCLOAK_CLIENT_SECRET__|$${KEYCLOAK_CLIENT_SECRET}|g" \
+            /opt/keycloak/data/import-template/realm-export.json \
+            > /opt/keycloak/data/import/realm-export.json
+        exec /opt/keycloak/bin/kc.sh start-dev --import-realm
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./keycloak:/opt/keycloak/data/import-template:ro
+      - secrets_tmp:/tmp/secrets
+    ports:
+      - "8080:8080"
+    networks:
+      - sdmx-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      keycloak:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      - secrets_tmp:/tmp/secrets
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: sdmx
+      KEYCLOAK_CLIENT_ID: sdmx-client
+      KEYCLOAK_CLIENT_SECRET_FILE: /tmp/secrets/KEYCLOAK_CLIENT_SECRET.txt
+      BACKEND_URL: http://backend:8000
+      POSTGRES_USER: sdmxuser
+      POSTGRES_DB: sdmxdb
+      POSTGRES_PASSWORD_FILE: /tmp/secrets/POSTGRES_PASSWORD.txt
+      XRPL_RPC_URL: https://s.devnet.rippletest.net:51234/
+      XRPL_FAUCET_URL: https://faucet.devnet.rippletest.net/accounts
+      WALLET_STORE_PATH: /tmp/wallets.json
+    ports:
+      - "8000:8000"
+    command:
+      - /bin/sh
+      - -c
+      - ./wait-for-keycloak.sh && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - sdmx-network
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BACKEND_URL: http://backend:8000
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: sdmx
+      KEYCLOAK_CLIENT_ID: sdmx-client
+      KEYCLOAK_CLIENT_SECRET_FILE: /tmp/secrets/KEYCLOAK_CLIENT_SECRET.txt
+    volumes:
+      - secrets_tmp:/tmp/secrets
+      - ./app:/app
+    ports:
+      - "8501:8501"
+    command:
+      - streamlit
+      - run
+      - /app/ui.py
+      - --server.port=8501
+      - --server.address=0.0.0.0
+    networks:
+      - sdmx-network
+
+volumes:
+  postgres_data:
+    driver: local
+  secrets_tmp:
+    driver: local
+
+networks:
+  sdmx-network:
+    driver: bridge

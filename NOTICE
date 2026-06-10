@@ -1,0 +1,13 @@
+SDMX Blockchain Validator
+Copyright 2026 Bank for International Settlements
+
+This product is licensed under the Apache License, Version 2.0
+(see the LICENSE file).
+
+This product includes third-party open-source software. All third-party
+open-source components are made available under their existing licenses.
+See THIRD_PARTY_NOTICES.md for the full list, including copyright notices
+and license texts.
+
+This software is a proof of concept. It targets the XRPL DevNet and is
+not hardened for production use.

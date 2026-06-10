@@ -1,0 +1,40 @@
+{
+    "realm": "sdmx",
+    "enabled": true,
+    "roles": {
+        "realm": [
+            {"name": "wallet_admin"}
+        ]
+    },
+    "clients": [
+        {
+            "clientId": "sdmx-client",
+            "enabled": true,
+            "protocol": "openid-connect",
+            "clientAuthenticatorType": "client-secret",
+            "publicClient": false,
+            "directAccessGrantsEnabled": true,
+            "redirectUris": ["http://localhost:8501/*", "http://localhost:8501*"],
+            "secret": "__KEYCLOAK_CLIENT_SECRET__",
+            "attributes": {}
+        }
+    ],
+    "users": [
+        {
+            "username": "sdmx",
+            "enabled": true,
+            "email": "admin@example.com",
+            "firstName": "SDMX",
+            "lastName": "Admin",
+            "emailVerified": true,
+            "credentials": [
+                {
+                    "type": "password",
+                    "value": "__KEYCLOAK_USER_PASSWORD__",
+                    "temporary": false
+                }
+            ],
+            "realmRoles": ["wallet_admin"]
+        }
+    ]
+}

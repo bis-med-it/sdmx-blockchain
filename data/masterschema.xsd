@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schema elementFormDefault="qualified" xmlns="http://www.w3.org/2001/XMLSchema">
+    <import namespace="urn:sdmx:org.sdmx.infomodel.datastructure.Dataflow=BIS:WS_CBPOL(1.0):ObsLevelDim:TIME_PERIOD" schemaLocation="./schemas/ws_cbpol_pretty.xsd"/>
+    <import namespace="http://www.sdmx.org/resources/sdmxml/schemas/v2_1/message https://registry.sdmx.org/schemas/v2_1/SDMXMessage.xsd" schemaLocation="./schemas/SDMXMessage.xsd"/>
+</schema>

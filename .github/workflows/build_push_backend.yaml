@@ -1,0 +1,33 @@
+name: Backend Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main # Trigger on pushes to the main branch
+  workflow_dispatch: # Allow manual runs
+
+env:
+  IMAGE_NAME: sdmx-validator-backend # Set your Docker image name here
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # Step 2: Log in to GitHub Container Registry
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u ${{ vars.GH_USER }} --password-stdin
+
+      # Step 3: Build the Docker image
+      - name: Build Docker image
+        run: |
+          docker build -t ghcr.io/bis-med-it/${{ env.IMAGE_NAME }}:latest -f Dockerfile .
+
+      # Step 4: Push the Docker image to GitHub Packages
+      - name: Push Docker image
+        run: |
+          docker push ghcr.io/bis-med-it/${{ env.IMAGE_NAME }}:latest

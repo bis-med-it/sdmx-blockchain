@@ -1,0 +1,10 @@
+# Please see the requirements.txt for a full list of verified dependencies.
+fastapi
+uvicorn[standard]
+python-dotenv
+xrpl-py>=2.0.0
+python-multipart
+lxml
+httpx
+requests
+python-jose[cryptography]

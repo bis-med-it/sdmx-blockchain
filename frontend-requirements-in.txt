@@ -1,0 +1,4 @@
+# Please see the frontend-requirements.txt for a full list of verified dependencies.
+streamlit==1.49.0
+requests==2.32.3
+python-dotenv==1.0.1
