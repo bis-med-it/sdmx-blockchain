@@ -5,6 +5,8 @@ python-dotenv
 xrpl-py>=2.0.0
 python-multipart
 lxml
+pyld
+py_ecc
 httpx
 requests
 python-jose[cryptography]

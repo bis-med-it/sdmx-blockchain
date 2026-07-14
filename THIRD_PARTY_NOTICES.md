@@ -14,8 +14,8 @@ Software Bill of Materials (`sbom.json`, CycloneDX format).
 
 Python dependencies are enumerated from:
 
-- [app/requirements.txt](app/requirements.txt) — backend
-- [app/frontend-requirements.txt](app/frontend-requirements.txt) — frontend
+- [requirements.txt](requirements.txt) — backend
+- [frontend-requirements.txt](frontend-requirements.txt) — frontend
 
 Container runtime dependencies are enumerated from
 [docker-compose.yml](docker-compose.yml).
@@ -25,9 +25,9 @@ Before each release, regenerate this file with:
 ```bash
 pip install pip-licenses cyclonedx-bom
 pip-licenses --format=markdown --with-urls --with-license-file --with-notice-file \
-  --packages $(cat app/requirements.txt app/frontend-requirements.txt | sed 's/[<>=!~].*//' | sort -u)
-cyclonedx-py requirements app/requirements.txt -o sbom-backend.json
-cyclonedx-py requirements app/frontend-requirements.txt -o sbom-frontend.json
+  --packages $(cat requirements.txt frontend-requirements.txt | sed 's/[<>=!~].*//' | sort -u)
+cyclonedx-py requirements requirements.txt -o sbom-backend.json
+cyclonedx-py requirements frontend-requirements.txt -o sbom-frontend.json
 ```
 
 Container images should be scanned with `syft <image> -o cyclonedx-json`
@@ -35,27 +35,20 @@ and the result merged into `sbom.json`.
 
 ## Python dependencies (dynamically linked, not embedded)
 
-### Backend ([app/requirements.txt](app/requirements.txt))
-
-| Component | SPDX License | Upstream |
-|---|---|---|
-| fastapi | MIT | https://github.com/fastapi/fastapi |
-| uvicorn[standard] | BSD-3-Clause | https://github.com/encode/uvicorn |
-| python-dotenv | BSD-3-Clause | https://github.com/theskumar/python-dotenv |
-| xrpl-py | ISC | https://github.com/XRPLF/xrpl-py |
-| python-multipart | Apache-2.0 | https://github.com/Kludex/python-multipart |
-| lxml | BSD-3-Clause | https://github.com/lxml/lxml |
-| httpx | BSD-3-Clause | https://github.com/encode/httpx |
-| requests | Apache-2.0 | https://github.com/psf/requests |
-| python-jose[cryptography] | MIT | https://github.com/mpdavis/python-jose |
-
-### Frontend ([app/frontend-requirements.txt](app/frontend-requirements.txt))
-
-| Component | SPDX License | Upstream |
-|---|---|---|
-| streamlit | Apache-2.0 | https://github.com/streamlit/streamlit |
-| requests | Apache-2.0 | https://github.com/psf/requests |
-| python-dotenv | BSD-3-Clause | https://github.com/theskumar/python-dotenv |
+| Name                      | Version     | License                              | URL                                                            |
+|---------------------------|-------------|--------------------------------------|----------------------------------------------------------------|
+| attrs                     | 26.1.0      | MIT                                  | https://www.attrs.org/en/stable/changelog.html                 |
+| idna                      | 3.18        | BSD-3-Clause                         | https://github.com/kjd/idna                                    |
+| jsonschema                | 4.26.0      | MIT                                  | https://github.com/python-jsonschema/jsonschema                |
+| jsonschema-specifications | 2025.9.1    | MIT                                  | https://github.com/python-jsonschema/jsonschema-specifications |
+| lxml                      | 6.1.1       | BSD-3-Clause                         | https://lxml.de/                                               |
+| packaging                 | 26.2        | Apache-2.0 OR BSD-2-Clause           | https://github.com/pypa/packaging                              |
+| python-dateutil           | 2.9.0.post0 | Apache Software License; BSD License | https://github.com/dateutil/dateutil                           |
+| referencing               | 0.37.0      | MIT                                  | https://github.com/python-jsonschema/referencing               |
+| rpds-py                   | 2026.6.3    | MIT                                  | https://github.com/crate-py/rpds                               |
+| six                       | 1.17.0      | MIT License                          | https://github.com/benjaminp/six                               |
+| typing_extensions         | 4.16.0      | PSF-2.0                              | https://github.com/python/typing_extensions                    |
+| tzdata                    | 2026.3      | Apache-2.0                           | https://github.com/python/tzdata                               |
 
 ### Transitive dependencies (non-exhaustive — see `sbom.json`)
 
@@ -76,11 +69,11 @@ full license texts — is produced in `sbom.json` at build time.
 
 ## Container runtime dependencies (not embedded; pulled at deploy time)
 
-| Image | SPDX License | Upstream |
-|---|---|---|
-| python:3.11-slim | PSF-2.0 (Python) + Debian package licenses | https://github.com/docker-library/python |
-| quay.io/keycloak/keycloak | Apache-2.0 | https://github.com/keycloak/keycloak |
-| postgres | PostgreSQL License (BSD-style) | https://github.com/docker-library/postgres |
+| Image                     | SPDX License                               | Upstream                                   |
+| ------------------------- | ------------------------------------------ | ------------------------------------------ |
+| python:3.11-slim          | PSF-2.0 (Python) + Debian package licenses | https://github.com/docker-library/python   |
+| quay.io/keycloak/keycloak | Apache-2.0                                 | https://github.com/keycloak/keycloak       |
+| postgres                  | PostgreSQL License (BSD-style)             | https://github.com/docker-library/postgres |
 
 These images are not embedded in this repository; they are pulled from
 their respective registries by Docker Compose at deploy time. Each image

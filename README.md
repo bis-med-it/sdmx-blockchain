@@ -160,25 +160,37 @@ This repository supports publishing SDMX files where you can anchor either:
 - a selection of one or more `<Series>` elements by computing per‑series hashes and anchoring a Merkle root.
 
 Key points:
-- Canonicalization: all hashing uses XML Exclusive C14N followed by SHA3‑512 to produce deterministic hashes.
+- Canonicalization: all hashing uses XML Exclusive C14N followed by SHA3‑512 to produce deterministic hashes. Before hashing, the backend applies the idempotent anchor‑stripping projection `strip_anchor`, removing **every** `<message:Source sourceID="sji:anchor">` element so the fingerprint commits to the statistical payload alone and files can be re‑anchored deterministically.
 - Series hashing: each `<Series>` element is canonicalized and hashed individually; these are the Merkle leaves.
-- Merkle construction: follows a domain-separated scheme (see our paper):
-  - Leaf node: `SHA3-512(0x00 || len32(h) || h)` where `h` is the 64-byte series hash and `len32` is 4-byte big-endian length.
-  - Internal node: `SHA3-512(0x01 || len32(L) || L || len32(R) || R)`.
+- Merkle construction: follows the domain-separated scheme in the paper (Section 4.1). Because all leaves and nodes are fixed‑length 64‑byte SHA3‑512 outputs, no length prefix is applied to leaves/nodes:
+  - Leaf: `H_leaf(h) = SHA3-512(0x00 || h)` where `h` is the 64-byte series/file hash.
+  - Internal node: `H_node(L, R) = SHA3-512(0x01 || L || R)`.
+  - Root wrapper (binds the leaf count `n`): `R = SHA3-512(0x02 || len32(n) || R_internal)`, where `len32(n)` is the 32-bit big-endian leaf count. For `n=1` the internal root is the single leaf (no padding). The value anchored on-chain is always this wrapped root `R`.
 
-What the backend writes into the SDMX file when you publish:
-- `Transaction Hash:<TX>` — when anchoring the whole file (legacy).
-- `Transaction Hash:<TX>;Type:MerkleRoot;Root:<ROOTHEX>;Leaves:<N>` — when anchoring a Merkle root for selected series.
-- A separate `<message:Source>` element with `MerkleLeaves:<hex1>,<hex2>,...` listing the ordered leaf hashes used to compute the root.
+What the backend writes into the SDMX file when you publish (a single self‑contained `<message:Source sourceID="sji:anchor">` element per item):
+- Anchor descriptor: `Transaction Hash:<TX>;Type:<Partial|WholeFile>;Root:<ROOTHEX>;Leaves:<N>;MerkleLeaves:<hex1>,<hex2>,...` — carries the transaction hash, anchor type, root, leaf count and ordered leaf fingerprints in one element. For whole‑file anchoring `Type:WholeFile` with a single leaf (the file fingerprint); for selected series `Type:Partial`.
+- Embedded Verifiable Credential: a second anchor‑tagged `<message:Source>` carrying `VC:<base64>`. The VC is a JSON‑LD credential canonicalized with **URDNA2015** (RDF Dataset Canonicalization) and signed with Ed25519 per the W3C `Ed25519Signature2020` suite; it binds `txHash`, `merkleRoot`, `anchorType` and the ordered leaf fingerprints. Canonicalization runs fully offline from an in‑process context cache (no network fetch).
+
+On publish the backend also (per Algorithm 1): stores the original payload `X` keyed by its fingerprint `h` in an object store (`OBJECT_STORE_PATH`), records anchor metadata `(R, tx_hash, ledger_index, timestamp)` — plus cached per‑series inclusion proofs for `Type:Partial` — in a metadata store (`METADATA_STORE_PATH`), and registers the VC signing key against the anchoring XRPL address in the attestation registry (`ATTESTATION_STORE_PATH`).
 
 API endpoints (relevant):
 - `POST /listSeries` — upload an SDMX file and get a JSON list of Series with computed per-series SHA3-512 hashes. Use this to choose which Series to anchor.
-- `POST /publishSDMX` — upload a file and publish. Optional query param `series` (comma-separated hex hashes) selects which series to include in the Merkle root; when used the returned file will contain the Merkle metadata described above.
+- `POST /publishSDMX` — upload a file and publish. Optional query param `series` (comma-separated hex hashes) selects which series to include in the Merkle root; when used the returned file carries a `Type:Partial` anchor descriptor, otherwise a `Type:WholeFile` descriptor.
 - `POST /validateSDMX` — upload a published file to validate it against the on‑chain memo. Validator supports:
-  - Merkle-root anchored files: it looks for `Transaction Hash` metadata and `MerkleLeaves:`; recomputes the Merkle root from the leaves and compares with the on‑chain memo.
-  - If `MerkleLeaves:` is missing but `Leaves` equals the number of `<Series>` in the file, validator will compute leaves from the file in document order and verify the root.
-  - If `Leaves==1` and `MerkleLeaves:` isn't present, validator will attempt single-leaf matching by constructing leaf nodes for each series and comparing directly to the memo.
-  - Legacy whole-file verification by canonicalizing the full XML and comparing the computed hash to the memo.
+  - `Type:WholeFile`: strips all anchors, canonicalizes the file, hashes it, computes the single‑leaf Merkle root and compares it to the on‑chain memo.
+  - `Type:Partial`: recomputes the Merkle root from the descriptor's `MerkleLeaves`, confirming each declared leaf is present among the file's `<Series>` fingerprints, and compares the root to the on‑chain memo.
+  - In both cases the embedded VC signature is verified and the VC signing key is cross‑checked against the attestation registry for the on‑chain transaction sender address (`tx.Account`).
+- `POST /seriesProof` — selective disclosure (Section 4.2). Upload a `Type:Partial` published file plus query param `series_hash`; returns the inclusion proof `π_i` (ordered sibling values + orientation bits) for that series, together with `tx_hash`, `root` and the leaf count. Lets a prover hand a single series and its proof to a third party without transmitting the whole file.
+- `POST /verifySeriesProof` — the Partial verification gauge for a third party holding only one series. Form fields: `series_hash`, `tx_hash`, `leaves` (leaf count `n`), and `proof` (JSON array of `{sibling, orientation}`). Recomputes the domain‑separated root `R = SHA3-512(0x02‖len32(n)‖R_internal)` from the proof and compares it to the on‑chain memo.
+- `POST /registerAttestation` / `POST /revokeAttestation` (role `wallet_admin`) and `GET /attestations/{address}` — manage and inspect the set of VC signing keys authorized for an XRPL anchoring address (the paper's on‑chain attestation registry).
+
+### BBS+ selective disclosure (Section 8.4)
+
+By default the embedded VC uses an Ed25519Signature2020 proof that attests the whole tuple `(tx_hash, R, h_1..h_n)` atomically. Passing `proof_type=bbs` to `/publishSDMX` instead issues a **BBS+ multi‑message VC** (BLS12‑381), enabling zero‑knowledge selective disclosure of individual series. The publisher's BBS+ signing key is a stable, separate identity key (persisted per address) whose public key is registered in the attestation registry.
+
+- `POST /publishSDMX?proof_type=bbs` — issue a BBS+‑anchored file. `/validateSDMX` verifies the full BBS+ signature and the registry attestation exactly as for Ed25519.
+- `POST /deriveBbsProof` — prover side. Form fields: the BBS+ file, `disclose` (comma‑separated leaf hashes to reveal; `tx_hash` and `R` are always revealed) and `nonce` (verifier challenge, hex). Returns a zero‑knowledge proof revealing only the chosen messages, plus Merkle inclusion proofs for the disclosed leaves.
+- `POST /verifyBbsProof` — verifier side. Form fields: `tx_hash`, `nonce`, `bbs_proof` (JSON), `merkle_proofs` (JSON). Checks (i) the BBS+ proof over the disclosed messages under the attested key, and (ii) that each disclosed leaf re‑binds to the on‑chain root `R` via its Merkle proof (Definition 8.4 condition (ii)), giving integrity independent of the BBS+ key.
 
 Example usage (publish selected series):
 

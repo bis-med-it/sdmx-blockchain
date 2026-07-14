@@ -21,47 +21,56 @@ def time_execution(func):
         return result
     return time_wrapper
 
+# Domain-separation identifier that marks a <message:Source> element as an SJI
+# blockchain anchor (as opposed to a Source carrying unrelated provenance text).
+# Per the paper (Section 4.1), every anchor descriptor and every embedded VC is
+# injected as a <message:Source> carrying sourceID="sji:anchor".
+SJI_ANCHOR_SOURCE_ID = "sji:anchor"
+
+
+def strip_anchor(root: etree._Element, ns_uri: str) -> etree._Element:
+    # Idempotent anchor-stripping projection strip_{anchor}(X): remove EVERY
+    # <message:Source> element carrying sourceID="sji:anchor", regardless of its
+    # content (anchor descriptor or VC). The whole-file fingerprint therefore
+    # commits to the statistical payload alone, independently of anchor history,
+    # so a file may be (re-)anchored any number of times deterministically.
+    # Mutates and returns the given root.
+    for src in root.findall(f".//{{{ns_uri}}}Source"):
+        if src.get("sourceID") == SJI_ANCHOR_SOURCE_ID:
+            parent = src.getparent()
+            if parent is not None:
+                parent.remove(src)
+    return root
+
+
+def add_anchor_source(header: etree._Element, ns_uri: str, text: str) -> etree._Element:
+    # Append a new anchor-tagged <message:Source sourceID="sji:anchor"> element.
+    el = etree.SubElement(header, f"{{{ns_uri}}}Source")
+    el.set("sourceID", SJI_ANCHOR_SOURCE_ID)
+    el.text = text
+    return el
+
+
+def find_anchor_sources(header: etree._Element, ns_uri: str) -> list[etree._Element]:
+    # Return all anchor-tagged <message:Source> elements under the given header.
+    return [
+        src
+        for src in header.findall(f".//{{{ns_uri}}}Source")
+        if src.get("sourceID") == SJI_ANCHOR_SOURCE_ID
+    ]
+
+
 def ensure_single_placeholder(root: etree._Element, ns_uri: str) -> etree._Element:
-    # Ensure exactly one <message:Source>Transaction Hash:</message:Source> exists in the Header.
-    # If there is any non-empty Transaction Hash (i.e. already anchored), raise error.
-    # If multiple empty placeholders exist, keep the first and remove the rest.
-    # If none exist, create a single placeholder as the last child of Header.
-    # Returns the placeholder element that should be used.
+    # DEPRECATED / retained for backward compatibility only.
+    # The paper's model (Section 4.1) replaces the "reject-on-re-anchor"
+    # placeholder scheme with the idempotent strip_anchor projection above, which
+    # permits deterministic re-anchoring. New code should call strip_anchor() and
+    # add_anchor_source() instead of this helper.
     header = root.find(f".//{{{ns_uri}}}Header")
     if header is None:
         raise HTTPException(status_code=400, detail="<message:Header> not found in XML.")
-
-    source_xpath = f".//{{{ns_uri}}}Source"
-    placeholders = []
-    filled = []
-
-    for tag in header.findall(source_xpath):
-        text = (tag.text or "").strip()
-        if text.lower().startswith("transaction hash:"):
-            value = text[len("Transaction Hash:"):].strip()
-            if value:
-                filled.append(tag)
-            else:
-                placeholders.append(tag)
-
-    if len(filled) > 0:
-        # File already contains a non-empty Transaction Hash -> do not re-publish
-        raise HTTPException(status_code=400, detail="File already contains a Transaction Hash.")
-
-    # If there are multiple empty placeholders, keep the first and remove others
-    if len(placeholders) >= 1:
-        keeper = placeholders[0]
-        # remove subsequent placeholders
-        for extra in placeholders[1:]:
-            parent = extra.getparent()
-            if parent is not None:
-                parent.remove(extra)
-    else:
-        # create a new placeholder deterministically as last child of header
-        keeper = etree.SubElement(header, f"{{{ns_uri}}}Source")
-        keeper.text = "Transaction Hash:"
-
-    # Normalize the keeper's text to exact placeholder
+    keeper = etree.SubElement(header, f"{{{ns_uri}}}Source")
+    keeper.set("sourceID", SJI_ANCHOR_SOURCE_ID)
     keeper.text = "Transaction Hash:"
     return keeper
 
@@ -116,35 +125,98 @@ def compute_series_hash(series_element: etree._Element, exclusive: bool = True, 
     return compute_sha3_512_bytes(c14n)
 
 
-def _len32_be(b: bytes) -> bytes:
-    return len(b).to_bytes(4, byteorder="big")
+def _len32_be_int(n: int) -> bytes:
+    # 32-bit big-endian encoding of the integer n (the leaf count), per the paper.
+    return int(n).to_bytes(4, byteorder="big")
+
+
+def _merkle_leaf(h_bytes: bytes) -> bytes:
+    # H_leaf(h) = SHA3-512(0x00 || h)   (Section 4.1, "Domain separation")
+    return compute_sha3_512_raw(b"\x00" + h_bytes)
+
+
+def _merkle_node(left: bytes, right: bytes) -> bytes:
+    # H_node(L, R) = SHA3-512(0x01 || L || R)
+    return compute_sha3_512_raw(b"\x01" + left + right)
 
 
 def merkle_root_from_hex_hashes(hex_hashes: list[str]) -> str:
-    # Implements the domain-separated leaf/node construction from the paper.
-    # Input: list of hex-encoded 512-bit hashes (uppercase/lowercase OK).
-    # Output: hex-encoded root (uppercase)
+    # Implements the domain-separated leaf/node/root construction from the paper
+    # (Section 4.1). Because leaves and internal nodes are all fixed-length
+    # 64-byte SHA3-512 outputs, the single-byte domain separators alone prevent
+    # concatenation ambiguity; length prefixing is NOT applied to leaves/nodes.
+    # The final root wraps the internal root with a domain-separated layer that
+    # explicitly binds the leaf count n:
+    #     R = SHA3-512(0x02 || len32(n) || R_internal).
+    # For n = 1 no padding is needed (the tree is a single leaf).
+    # Input:  list of hex-encoded 512-bit hashes (case-insensitive).
+    # Output: hex-encoded root (uppercase).
     if not hex_hashes:
         raise ValueError("No hashes provided for Merkle root")
 
-    # Convert each underlying h (hex) to raw bytes
-    leaves: list[bytes] = []
-    for h in hex_hashes:
-        h_bytes = bytes.fromhex(h)
-        leaf = compute_sha3_512_raw(b"\x00" + _len32_be(h_bytes) + h_bytes)
-        leaves.append(leaf)
+    n = len(hex_hashes)
 
-    # Build tree
+    # Leaves L_i = H_leaf(h_i)
+    leaves: list[bytes] = [_merkle_leaf(bytes.fromhex(h)) for h in hex_hashes]
+
+    # Internal root: single leaf needs no padding; otherwise pad to the next
+    # power of two by duplicating the final leaf, forming a perfect binary tree.
     nodes = leaves
     while len(nodes) > 1:
         next_level: list[bytes] = []
         for i in range(0, len(nodes), 2):
             left = nodes[i]
             right = nodes[i + 1] if i + 1 < len(nodes) else nodes[i]
-            combined = b"\x01" + _len32_be(left) + left + _len32_be(right) + right
-            parent = compute_sha3_512_raw(combined)
-            next_level.append(parent)
+            next_level.append(_merkle_node(left, right))
         nodes = next_level
 
-    root = nodes[0]
+    root_internal = nodes[0]
+
+    # Domain-separated root wrapper binding the leaf count n.
+    root = compute_sha3_512_raw(b"\x02" + _len32_be_int(n) + root_internal)
+    return root.hex().upper()
+
+
+def merkle_inclusion_proof(hex_hashes: list[str], index: int) -> list[tuple[str, str]]:
+    # Generate an inclusion proof pi_i for the leaf at position `index` over the
+    # ordered leaf fingerprints `hex_hashes` (Section 4.2). The proof is the ordered
+    # list of sibling node values together with an orientation bit indicating on
+    # which side the sibling sits ('L' = sibling is left, 'R' = sibling is right),
+    # so the root recomputation via H_node is unambiguous. Padding follows the
+    # paper's scheme: odd levels duplicate the final node before pairing.
+    if not hex_hashes:
+        raise ValueError("No hashes provided for inclusion proof")
+    if not (0 <= index < len(hex_hashes)):
+        raise ValueError("Leaf index out of range")
+
+    nodes = [_merkle_leaf(bytes.fromhex(h)) for h in hex_hashes]
+    proof: list[tuple[str, str]] = []
+    idx = index
+    while len(nodes) > 1:
+        # Pad to an even count by duplicating the final node (perfect-tree scheme).
+        if len(nodes) % 2 == 1:
+            nodes = nodes + [nodes[-1]]
+        sib = idx ^ 1
+        orientation = "R" if sib > idx else "L"
+        proof.append((nodes[sib].hex().upper(), orientation))
+        nodes = [_merkle_node(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)]
+        idx //= 2
+    return proof
+
+
+def root_from_inclusion_proof(leaf_hex: str, proof: list[tuple[str, str]], n: int) -> str:
+    # Recompute the domain-separated Merkle root R from a leaf fingerprint and its
+    # inclusion proof (Section 4.2). Applies H_leaf to the fingerprint, folds in the
+    # ordered siblings via H_node respecting orientation bits, then wraps the
+    # internal root with the leaf-count-binding layer: R = SHA3-512(0x02||len32(n)||R_int).
+    cur = _merkle_leaf(bytes.fromhex(leaf_hex))
+    for sib_hex, orientation in proof:
+        sib = bytes.fromhex(sib_hex)
+        if orientation == "R":
+            cur = _merkle_node(cur, sib)
+        elif orientation == "L":
+            cur = _merkle_node(sib, cur)
+        else:
+            raise ValueError(f"Invalid orientation bit: {orientation!r}")
+    root = compute_sha3_512_raw(b"\x02" + _len32_be_int(n) + cur)
     return root.hex().upper()

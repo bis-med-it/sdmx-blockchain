@@ -35,7 +35,7 @@ async def get_account_balance_xrp(address: str) -> float:
     balance_drops = int(response.result["account_data"]["Balance"])
     return float(balance_drops) / 1_000_000  # drops → XRP
 
-async def anchor_hash(wallet: Wallet, hash_hex: str, destination: str) -> str:
+async def anchor_hash(wallet: Wallet, hash_hex: str, destination: str) -> tuple[str, int | None]:
     txn = Payment(
         account=wallet.address,
         destination=destination,
@@ -54,8 +54,8 @@ async def anchor_hash(wallet: Wallet, hash_hex: str, destination: str) -> str:
     print("Transaction", tx_hash, "was validated in ledger:", ledger_index)
     if not tx_hash:
         raise ValueError("Transaction hash not found in response.")
-    # Now the transaction is validated; you can return the hash or response
-    return tx_hash
+    # Now the transaction is validated; return the hash and ledger index
+    return tx_hash, ledger_index
 
 
 async def fetch_transaction(tx_hash: str) -> dict:

@@ -19,9 +19,13 @@ from app.xrpl_client import (
     fetch_transaction,
     get_account_balance_xrp,
 )
-from app.utils import compute_sha3_512_c14n, ensure_single_placeholder, message_namespace
-from app.utils import compute_series_hash, merkle_root_from_hex_hashes, compute_sha3_512_raw
+from app.utils import compute_sha3_512_c14n, message_namespace
+from app.utils import compute_series_hash, merkle_root_from_hex_hashes
+from app.utils import merkle_inclusion_proof, root_from_inclusion_proof
+from app.utils import strip_anchor, add_anchor_source, find_anchor_sources
 from app.vc import issue_vc, verify_vc, encode_vc_for_source, decode_vc_from_source_text
+from app.vc import issue_bbs_vc, verify_bbs_vc, is_bbs_vc, bbs_message_vector
+from app import attestation, object_store, bbs, bbs_keystore
 from app.account_store import save_wallet, load_wallet
 from app.schemas import (
     WalletResponse,
@@ -227,7 +231,7 @@ async def clear_wallets():
     response_model=PublishResponse,
     responses={400: {"model": ErrorResponse}},
 )
-async def publish_sdmx(file: UploadFile = File(...), req: PublishRequest = Depends(), series: str | None = None):
+async def publish_sdmx(file: UploadFile = File(...), req: PublishRequest = Depends(), series: str | None = None, proof_type: str = "ed25519"):
     start_time = time.perf_counter()
     try:
         raw = await file.read()
@@ -242,7 +246,14 @@ async def publish_sdmx(file: UploadFile = File(...), req: PublishRequest = Depen
 
 
         ns_uri = message_namespace(root)
-        placeholder = ensure_single_placeholder(root, ns_uri)
+        header = root.find(f".//{{{ns_uri}}}Header")
+        if header is None:
+            raise HTTPException(status_code=400, detail="<message:Header> not found in XML.")
+
+        # Idempotent anchor stripping: remove any anchor descriptors / VCs left by a
+        # prior anchoring run so the fingerprint commits to the statistical payload
+        # alone and the file can be (re-)anchored deterministically (Section 4.1).
+        strip_anchor(root, ns_uri)
 
         # Compute per-Series hashes
         series_elements = root.findall('.//Series')
@@ -254,21 +265,37 @@ async def publish_sdmx(file: UploadFile = File(...), req: PublishRequest = Depen
             series_hashes.append({'id': series_id, 'hash': h})
 
         requested = None  # Ensure requested is always defined
-        # If caller provided a comma-separated list of hex hashes to anchor, build a Merkle root
+        # Whole-file fingerprint h = SHA3-512(C14N(strip_anchor(X))), used as the
+        # object-store key regardless of anchor granularity (Algorithm 1, "store (X,h)").
+        xml_bytes = etree.tostring(root, encoding="utf-8", xml_declaration=True, pretty_print=False)
+        file_hash = compute_sha3_512_c14n(xml_bytes)
+
         if series:
+            # Partial anchoring: anchor a Merkle root over the selected series' leaves.
             requested = [x.strip().upper() for x in series.split(',') if x.strip()]
             # validate requested hashes exist
             available = {item['hash'].upper() for item in series_hashes}
             missing = [r for r in requested if r not in available]
             if missing:
                 raise HTTPException(status_code=400, detail=f"Requested series hashes not found: {missing}")
+            anchor_type = "Partial"
+            leaves = requested
             merkle_root = merkle_root_from_hex_hashes(requested)
-            dataset_hash = merkle_root
-            # write an explicit Source indicating merkle root and count
-            placeholder.text = f"Transaction Hash:{''}"  # placeholder text until tx
         else:
-            xml_bytes = etree.tostring(root, encoding="utf-8", xml_declaration=True, pretty_print=False)
-            dataset_hash = compute_sha3_512_c14n(xml_bytes)
+            # Whole-file anchoring: single-leaf Merkle gauge over the file fingerprint h.
+            anchor_type = "WholeFile"
+            leaves = [file_hash]
+            merkle_root = merkle_root_from_hex_hashes([file_hash])
+
+        # The value anchored on-chain is always the domain-separated Merkle root R.
+        dataset_hash = merkle_root
+
+        # Persist the original payload keyed by its fingerprint in the object store
+        # (Algorithm 1: "store (X,h) in object store").
+        try:
+            object_store.store_payload(raw, file_hash)
+        except Exception as e:
+            logger.warning("Object-store persistence failed (non-fatal): %s", e)
 
         sha_time = time.perf_counter() - file_read
         print(f"Processing time for computing SHA: {sha_time}");
@@ -283,36 +310,68 @@ async def publish_sdmx(file: UploadFile = File(...), req: PublishRequest = Depen
         wallet_time = time.perf_counter() - sha_time
         print(f"Processing time for checking wallets is: {wallet_time}");
 
-        tx_hash = await anchor_hash(wallet, dataset_hash, req.destination)
-        # If series selection was used, embed a short structured Source value
-        if series and requested is not None:
-            placeholder.text = f"Transaction Hash:{tx_hash};Type:MerkleRoot;Root:{dataset_hash};Leaves:{len(requested)}"
-            # Add an additional <message:Source> containing the ordered leaf hashes so validators can re-compute the root
-            try:
-                header = root.find(f".//{{{ns_uri}}}Header")
-                if header is not None:
-                    leaves_text = ",".join(requested)
-                    etree.SubElement(header, f"{{{ns_uri}}}Source").text = f"MerkleLeaves:{leaves_text}"
-            except Exception:
-                # non-fatal: continue without writing leaves
-                pass
-        else:
-            placeholder.text = f"Transaction Hash:{tx_hash}"
+        tx_hash, ledger_index = await anchor_hash(wallet, dataset_hash, req.destination)
 
-        # Issue and embed a W3C Verifiable Credential binding publisher identity to the anchor.
+        # Inject a single self-contained anchor descriptor carrying the transaction
+        # hash, anchor type, root, leaf count and ordered leaf fingerprints, all in
+        # one <message:Source sourceID="sji:anchor"> element (Section 4, Step 5).
+        leaves_text = ",".join(leaves)
+        descriptor = (
+            f"Transaction Hash:{tx_hash};Type:{anchor_type};"
+            f"Root:{dataset_hash};Leaves:{len(leaves)};MerkleLeaves:{leaves_text}"
+        )
+        add_anchor_source(header, ns_uri, descriptor)
+
+        # Cache per-leaf inclusion proofs {pi_i} for on-demand partial verification
+        # (Algorithm 1) and record anchor metadata (R, tx_hash, ledger_index, ts).
+        cached_proofs: dict = {}
+        if anchor_type == "Partial":
+            for i, leaf_hash in enumerate(leaves):
+                proof = merkle_inclusion_proof(leaves, i)
+                cached_proofs[leaf_hash] = [{"sibling": s, "orientation": o} for s, o in proof]
         try:
-            vc = issue_vc(
-                issuer_address=wallet.address,
-                issuer_public_key_hex=wallet.public_key,
-                issuer_private_key_hex=wallet.private_key,
+            object_store.record_anchor(
+                root=dataset_hash,
                 tx_hash=tx_hash,
-                dataset_hash=dataset_hash,
-                anchor_type="MerkleRoot" if (series and requested is not None) else "WholeFile",
-                leaves=requested if (series and requested is not None) else None,
+                ledger_index=ledger_index,
+                anchor_type=anchor_type,
+                leaves=leaves,
+                proofs=cached_proofs or None,
             )
-            header = root.find(f".//{{{ns_uri}}}Header")
-            if header is not None:
-                etree.SubElement(header, f"{{{ns_uri}}}Source").text = encode_vc_for_source(vc)
+        except Exception as e:
+            logger.warning("Anchor-metadata persistence failed (non-fatal): %s", e)
+
+        # Issue and embed a Verifiable Credential binding publisher identity to the
+        # anchor. Default is an Ed25519Signature2020 VC; proof_type="bbs" issues a
+        # BBS+ multi-message VC enabling zero-knowledge selective disclosure (S8.4).
+        try:
+            if proof_type.lower() == "bbs":
+                bbs_sk_hex, bbs_pk_hex = bbs_keystore.get_or_create(wallet.address)
+                vc = issue_bbs_vc(
+                    issuer_address=wallet.address,
+                    bbs_public_key_hex=bbs_pk_hex,
+                    bbs_secret_key_hex=bbs_sk_hex,
+                    tx_hash=tx_hash,
+                    merkle_root=dataset_hash,
+                    anchor_type=anchor_type,
+                    leaves=leaves,
+                )
+                # Attest the BBS+ signing key for this anchoring address (Algorithm 2).
+                attestation.register_key(wallet.address, bbs_pk_hex)
+            else:
+                vc = issue_vc(
+                    issuer_address=wallet.address,
+                    issuer_public_key_hex=wallet.public_key,
+                    issuer_private_key_hex=wallet.private_key,
+                    tx_hash=tx_hash,
+                    merkle_root=dataset_hash,
+                    anchor_type=anchor_type,
+                    leaves=leaves,
+                )
+                # Register the VC signing key against this anchoring address in the
+                # attestation registry so consumers can authorize it (Algorithm 2).
+                attestation.register_key(wallet.address, wallet.public_key)
+            add_anchor_source(header, ns_uri, encode_vc_for_source(vc))
         except Exception as e:
             logger.warning("VC issuance failed (non-fatal): %s", e)
         out_bytes = etree.tostring(root, encoding="utf-8", xml_declaration=True, pretty_print=False)
@@ -341,41 +400,37 @@ async def validate_sdmx(file: UploadFile = File(...)):
     if header is None:
         raise HTTPException(status_code=400, detail="<message:Header> not found in XML.")
 
-    # Locate optional embedded VC; verified after we have the on-chain tx for cross-checks.
+    # Collect anchor-tagged <message:Source sourceID="sji:anchor"> elements: one
+    # carries the anchor descriptor, another (optionally) the embedded VC.
     embedded_vc: dict | None = None
-    for tag_vc in header.findall(f".//{{{message_ns}}}Source"):
-        decoded = decode_vc_from_source_text((tag_vc.text or "").strip())
+    descriptor_text: str | None = None
+    for src in find_anchor_sources(header, message_ns):
+        text = (src.text or "").strip()
+        decoded = decode_vc_from_source_text(text)
         if decoded is not None:
             embedded_vc = decoded
-            break
+        elif text.lower().startswith("transaction hash:"):
+            if descriptor_text is not None:
+                return ValidateResponse(valid=False, reason="Multiple anchor descriptors found in file.")
+            descriptor_text = text
 
-    tx_source_tags = []
-    for tag in header.findall(f".//{{{message_ns}}}Source"):
-        text = (tag.text or "").strip()
-        if text.lower().startswith("transaction hash:"):
-            value = text[len("Transaction Hash:"):].strip()
-            tx_source_tags.append((tag, value))
+    if descriptor_text is None:
+        return ValidateResponse(valid=False, reason="No anchor descriptor (Transaction Hash) found in file.")
 
-    if len(tx_source_tags) > 1:
-        return ValidateResponse(valid=False, reason="Multiple Transaction Hash tags found in file.")
-    if len(tx_source_tags) == 0:
-        return ValidateResponse(valid=False, reason="No Transaction Hash tag found in file.")
-
-    # Take the first Transaction Hash tag and parse possible metadata (e.g. Type:MerkleRoot;Root:...;Leaves:N)
-    tag, value = tx_source_tags[0]
-    if not value:
-        return ValidateResponse(valid=False, reason="Transaction Hash tag is empty (no transaction hash present).")
-
-    # value may contain metadata after semicolons; tx_hash is the first token before any ';'
+    # Parse the self-contained descriptor:
+    #   Transaction Hash:<tx>;Type:<Partial|WholeFile>;Root:<R>;Leaves:<N>;MerkleLeaves:<h1,...>
+    value = descriptor_text[len("Transaction Hash:"):].strip()
     parts = [p.strip() for p in value.split(";") if p.strip()]
-    tx_hash_from_file = parts[0]
-    meta = {}
+    tx_hash_from_file = parts[0] if parts else ""
+    meta: dict = {}
     for token in parts[1:]:
         if ":" in token:
             k, v = token.split(":", 1)
             meta[k.strip()] = v.strip()
+    if not tx_hash_from_file:
+        return ValidateResponse(valid=False, reason="Anchor descriptor has no transaction hash.")
 
-    # Fetch transaction from chain using tx hash only
+    # Fetch transaction from chain and read the anchored Merkle root R from its memo.
     try:
         tx_data = await fetch_transaction(tx_hash_from_file)
     except Exception as e:
@@ -390,136 +445,78 @@ async def validate_sdmx(file: UploadFile = File(...)):
     if not memo_data:
         return ValidateResponse(valid=False, reason="MemoData not found in transaction.")
 
-    memo_hash = memo_data.strip().upper()
+    memo_hash = memo_data.strip().upper()  # on-chain root R
 
-    # Verify embedded VC (if any) and cross-check publisher identity against the on-chain signer.
-    vc_kwargs: dict = {}
-    if embedded_vc is not None:
-        sig_ok, vc_reason = verify_vc(embedded_vc)
-        subject = embedded_vc.get("credentialSubject", {}) if isinstance(embedded_vc, dict) else {}
-        issuer = embedded_vc.get("issuer") if isinstance(embedded_vc, dict) else None
-        vc_pub = embedded_vc.get("proof", {}).get("publicKeyHex") if isinstance(embedded_vc, dict) else None
-        on_chain_pub = tx_data.get("SigningPubKey")
-        on_chain_account = tx_data.get("Account")
-        identity_ok = bool(vc_pub) and bool(on_chain_pub) and vc_pub.upper() == on_chain_pub.upper()
-        subject_tx_ok = subject.get("txHash", "").lower() == tx_hash_from_file.lower()
-        subject_root_ok = subject.get("datasetHash", "").upper() == memo_hash
-        vc_verified = bool(sig_ok and identity_ok and subject_tx_ok and subject_root_ok)
-        reasons = [vc_reason]
-        if not identity_ok:
-            reasons.append(f"VC publicKeyHex does not match on-chain SigningPubKey ({on_chain_account}).")
-        if not subject_tx_ok:
-            reasons.append("VC subject txHash does not match referenced transaction.")
-        if not subject_root_ok:
-            reasons.append("VC subject datasetHash does not match on-chain memo.")
-        vc_kwargs = {
-            "vc_verified": vc_verified,
-            "vc_issuer": issuer,
-            "vc_subject": subject if isinstance(subject, dict) else None,
-            "vc_reason": "; ".join(r for r in reasons if r),
-        }
+    anchor_type = meta.get("Type", "WholeFile")
 
-    # If metadata indicates this is a Merkle root anchoring, verify using MerkleLeaves found in Header
-    if meta.get("Type") == "MerkleRoot" or "Root" in meta:
-        # Find MerkleLeaves source in header
-        leaves_tag = None
-        for tag2 in header.findall(f".//{{{message_ns}}}Source"):
-            t2 = (tag2.text or "").strip()
-            if t2.startswith("MerkleLeaves:"):
-                leaves_tag = tag2
-                break
-
-        if leaves_tag is None:
-            # Attempt fallback: if the Transaction Hash metadata included a Leaves count and that count
-            # equals the number of Series elements in the file, reconstruct leaves from all Series
-            leaves = None
-            if "Leaves" in meta:
-                try:
-                    leaves_count = int(meta["Leaves"]) if meta["Leaves"] is not None else None
-                except Exception:
-                    leaves_count = None
-
-                if leaves_count is not None:
-                    series_elements = root.findall('.//Series')
-                    if leaves_count == len(series_elements) and len(series_elements) > 0:
-                        leaves = [compute_series_hash(s).upper() for s in series_elements]
-
-            if leaves is None:
-                # If the anchor was for a single leaf (Leaves==1) we can try to find which series
-                # produced the root by constructing the leaf node from each series hash and comparing.
-                try:
-                    if "Leaves" in meta and int(meta.get("Leaves", 0)) == 1:
-                        series_elements = root.findall('.//Series')
-                        found = False
-                        for s in series_elements:
-                            h = compute_series_hash(s).upper()
-                            h_bytes = bytes.fromhex(h)
-                            leaf = compute_sha3_512_raw(b"\x00" + len(h_bytes).to_bytes(4, byteorder="big") + h_bytes)
-                            if leaf.hex().upper() == memo_hash:
-                                found = True
-                                break
-                        if found:
-                            processing_time = time.perf_counter() - start_time
-                            print(f"Processing time for this validation is: {processing_time}");
-                            return ValidateResponse(valid=True, reason="Transaction memo matches Merkle root for a single series present in file (valid).", **vc_kwargs)
-                except Exception:
-                    pass
-
-                return ValidateResponse(valid=False, reason="Merkle-root anchor found but no MerkleLeaves present in file to validate inclusion.")
-        else:
-            leaves_raw = leaves_tag.text.strip()[len("MerkleLeaves:"):].strip()
-            leaves = [h.strip().upper() for h in leaves_raw.split(",") if h.strip()]
-            if not leaves:
-                return ValidateResponse(valid=False, reason="MerkleLeaves is empty in file.")
-
-        # Ensure leaves are present in the uploaded file's series
-        parser = etree.XMLParser(remove_blank_text=True, ns_clean=True, recover=False)
+    # ---- Cryptographic gauge: recompute R and compare with the on-chain memo ----
+    if anchor_type == "WholeFile":
+        # Single-leaf Merkle gauge over the anchor-free file fingerprint.
+        strip_anchor(root, message_ns)
+        xml_bytes = etree.tostring(root, encoding="utf-8", xml_declaration=True, pretty_print=False)
         try:
-            # we already have root; compute per-series hashes
+            file_hash = compute_sha3_512_c14n(xml_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Error canonicalizing/hashing XML: {e}")
+        recomputed_root = merkle_root_from_hex_hashes([file_hash])
+    elif anchor_type == "Partial":
+        # Recompute the Merkle root from the declared leaves and confirm each leaf
+        # is present among the file's <Series> fingerprints.
+        leaves_raw = meta.get("MerkleLeaves", "")
+        leaves = [h.strip().upper() for h in leaves_raw.split(",") if h.strip()]
+        if not leaves:
+            return ValidateResponse(valid=False, reason="Partial anchor found but no MerkleLeaves present to validate inclusion.")
+        try:
             series_elements = root.findall('.//Series')
             available = {compute_series_hash(s).upper() for s in series_elements}
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error computing series hashes for validation: {e}")
-
         missing = [h for h in leaves if h not in available]
         if missing:
             return ValidateResponse(valid=False, reason=f"Some MerkleLeaves are not present in the uploaded file: {missing}")
-
-        # Recompute Merkle root from supplied leaves (order matters)
         try:
             recomputed_root = merkle_root_from_hex_hashes(leaves)
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error computing Merkle root: {e}")
-
-        if recomputed_root == memo_hash:
-            processing_time = time.perf_counter() - start_time
-            print(f"Processing time for this validation is: {processing_time}");
-            return ValidateResponse(valid=True, reason="Transaction memo matches Merkle root computed from file MerkleLeaves (valid).", **vc_kwargs)
-        else:
-            processing_time = time.perf_counter() - start_time
-            print(f"Processing time for this validation is: {processing_time}");
-            return ValidateResponse(valid=False, reason=f"Memo mismatch: on-chain memo {memo_hash} != recomputed Merkle root {recomputed_root}")
-
-    # Fallback: legacy whole-file anchoring
-    tag.text = "Transaction Hash:"
-    xml_bytes = etree.tostring(root, encoding="utf-8", xml_declaration=True, pretty_print=False)
-
-    try:
-        dataset_hash = compute_sha3_512_c14n(xml_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error canonicalizing/hashing XML: {e}")
-
-    if memo_hash == dataset_hash:
-        processing_time = time.perf_counter() - start_time
-        print(f"Processing time for this validation is: {processing_time}");
-        return ValidateResponse(valid=True, reason="Transaction memo matches dataset hash (valid).", **vc_kwargs)
     else:
-        processing_time = time.perf_counter() - start_time
-        print(f"Processing time for this validation is: {processing_time}");
-        return ValidateResponse(
-            valid=False,
-            reason=f"Memo mismatch: on-chain memo {memo_hash} != computed dataset hash {dataset_hash}"
-        )
+        return ValidateResponse(valid=False, reason=f"Unknown anchor Type '{anchor_type}'.")
+
+    crypto_ok = recomputed_root == memo_hash
+    if crypto_ok:
+        crypto_reason = "Transaction memo matches recomputed Merkle root (valid)."
+    else:
+        crypto_reason = f"Memo mismatch: on-chain root {memo_hash} != recomputed root {recomputed_root}"
+
+    # ---- VC and identity verification (shared across gauges) ----
+    reasons = [crypto_reason]
+    vc_ok = True
+    if embedded_vc is not None:
+        if is_bbs_vc(embedded_vc):
+            sig_ok, vc_reason = verify_bbs_vc(embedded_vc)
+        else:
+            sig_ok, vc_reason = verify_vc(embedded_vc)
+        subject = embedded_vc.get("credentialSubject", {}) if isinstance(embedded_vc, dict) else {}
+        vc_pub = embedded_vc.get("proof", {}).get("publicKeyHex") if isinstance(embedded_vc, dict) else None
+        # Cross-check the VC signing key against the on-chain transaction sender's
+        # address (tx_data.Account) via the attestation registry; SigningPubKey may
+        # differ under regular-key signing, so the sender Account is the
+        # authoritative anchoring identity (Algorithm 2).
+        on_chain_account = tx_data.get("Account")
+        identity_ok = bool(vc_pub) and bool(on_chain_account) and attestation.is_authorized(on_chain_account, vc_pub)
+        subject_tx_ok = subject.get("txHash", "").lower() == tx_hash_from_file.lower()
+        subject_root_ok = subject.get("merkleRoot", "").upper() == memo_hash
+        vc_ok = bool(sig_ok and identity_ok and subject_tx_ok and subject_root_ok)
+        reasons.append(vc_reason)
+        if not identity_ok:
+            reasons.append(f"VC signing key not attested for on-chain address {on_chain_account}.")
+        if not subject_tx_ok:
+            reasons.append("VC subject txHash does not match referenced transaction.")
+        if not subject_root_ok:
+            reasons.append("VC subject merkleRoot does not match on-chain root.")
+
+    processing_time = time.perf_counter() - start_time
+    print(f"Processing time for this validation is: {processing_time}");
+    return ValidateResponse(valid=bool(crypto_ok and vc_ok), reason="; ".join(r for r in reasons if r))
 
 
 @app.post("/listSeries")
@@ -542,3 +539,294 @@ async def list_series(file: UploadFile = File(...)):
         h = compute_series_hash(s)
         out.append({'id': sid, 'hash': h})
     return {'count': len(out), 'series': out}
+
+
+def _parse_anchor_descriptor(header, message_ns) -> dict:
+    """Extract and parse the single sji:anchor descriptor from a published file.
+
+    Returns a dict with keys: tx_hash, Type, Root, Leaves, MerkleLeaves (list).
+    Raises HTTPException(400) if no descriptor is present.
+    """
+    for src in find_anchor_sources(header, message_ns):
+        text = (src.text or "").strip()
+        if text.lower().startswith("transaction hash:"):
+            value = text[len("Transaction Hash:"):].strip()
+            parts = [p.strip() for p in value.split(";") if p.strip()]
+            meta = {"tx_hash": parts[0] if parts else ""}
+            for token in parts[1:]:
+                if ":" in token:
+                    k, v = token.split(":", 1)
+                    meta[k.strip()] = v.strip()
+            leaves_raw = meta.get("MerkleLeaves", "")
+            meta["MerkleLeaves"] = [h.strip().upper() for h in leaves_raw.split(",") if h.strip()]
+            return meta
+    raise HTTPException(status_code=400, detail="No anchor descriptor (Transaction Hash) found in file.")
+
+
+@app.post("/seriesProof")
+async def series_proof(file: UploadFile = File(...), series_hash: str | None = None):
+    """Return the Merkle inclusion proof pi_i for one anchored series.
+
+    Implements the paper's on-demand proof retrieval (Section 4.2): given a
+    published file and the target series' SHA3-512 fingerprint, return the ordered
+    sibling values and orientation bits that a third party can use to verify the
+    series against the on-chain root without possessing the full file.
+    """
+    raw = await file.read()
+    parser = etree.XMLParser(remove_blank_text=True, ns_clean=True, recover=False)
+    try:
+        root = etree.fromstring(raw, parser=parser)
+    except etree.XMLSyntaxError:
+        raise HTTPException(status_code=400, detail="Uploaded file is not valid XML.")
+
+    message_ns = message_namespace(root)
+    header = root.find(f".//{{{message_ns}}}Header")
+    if header is None:
+        raise HTTPException(status_code=400, detail="<message:Header> not found in XML.")
+
+    meta = _parse_anchor_descriptor(header, message_ns)
+    if meta.get("Type") != "Partial":
+        raise HTTPException(status_code=400, detail="Inclusion proofs are only defined for Partial (series-level) anchors.")
+    leaves = meta["MerkleLeaves"]
+    if not leaves:
+        raise HTTPException(status_code=400, detail="Anchor descriptor carries no MerkleLeaves.")
+    if not series_hash:
+        raise HTTPException(status_code=400, detail="Query parameter 'series_hash' is required.")
+
+    target = series_hash.strip().upper()
+    if target not in leaves:
+        raise HTTPException(status_code=400, detail="Requested series_hash is not among the anchored leaves.")
+
+    index = leaves.index(target)
+    proof = merkle_inclusion_proof(leaves, index)
+    return {
+        "tx_hash": meta["tx_hash"],
+        "root": meta.get("Root", ""),
+        "leaves": len(leaves),
+        "series_hash": target,
+        "index": index,
+        "proof": [{"sibling": s, "orientation": o} for s, o in proof],
+    }
+
+
+@app.post("/verifySeriesProof", response_model=ValidateResponse, responses={400: {"model": ErrorResponse}})
+async def verify_series_proof(
+    series_hash: str = Form(...),
+    tx_hash: str = Form(...),
+    leaves: int = Form(...),
+    proof: str = Form(...),
+):
+    """Verify a single series against the on-chain root using an inclusion proof.
+
+    This is the paper's Partial verification gauge (Algorithm 2): a third party
+    that holds only one series' fingerprint and its inclusion proof pi_i (not the
+    whole file) recomputes the domain-separated root and compares it to the memo
+    of the referenced XRPL transaction. `proof` is a JSON array of objects with
+    keys `sibling` (hex) and `orientation` ('L'|'R').
+    """
+    try:
+        proof_items = json.loads(proof)
+        proof_pairs = [(p["sibling"].strip().upper(), p["orientation"].strip().upper()) for p in proof_items]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Malformed proof: {e}")
+
+    try:
+        recomputed_root = root_from_inclusion_proof(series_hash.strip().upper(), proof_pairs, int(leaves))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error recomputing root from proof: {e}")
+
+    try:
+        tx_data = await fetch_transaction(tx_hash.strip())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error fetching transaction {tx_hash}: {e}")
+
+    memos = tx_data.get("Memos") or tx_data.get("meta", {}).get("Memos") or []
+    if not memos:
+        return ValidateResponse(valid=False, reason="No memos found in the referenced transaction.")
+    memo_obj = memos[0].get("Memo", {}) if isinstance(memos[0], dict) else {}
+    memo_data = memo_obj.get("MemoData") or memo_obj.get("memo_data") or ""
+    if not memo_data:
+        return ValidateResponse(valid=False, reason="MemoData not found in transaction.")
+    memo_hash = memo_data.strip().upper()
+
+    if recomputed_root == memo_hash:
+        return ValidateResponse(valid=True, reason="Series inclusion proof verifies against the on-chain Merkle root (valid).")
+    return ValidateResponse(valid=False, reason=f"Proof mismatch: on-chain root {memo_hash} != recomputed root {recomputed_root}")
+
+
+@app.post("/registerAttestation", dependencies=[Depends(require_role("wallet_admin"))])
+async def register_attestation(address: str = Form(...), public_key_hex: str = Form(...)):
+    """Register a VC signing public key as authorized for an XRPL anchoring address.
+
+    Models the paper's on-chain attestation registry update (a signed registration
+    from the anchoring key). Publishing already auto-registers the issuing key;
+    this endpoint supports registering additional or rotated identity keys.
+    """
+    attestation.register_key(address.strip(), public_key_hex.strip())
+    return {"address": address, "registered_keys": sorted(attestation.lookup(address))}
+
+
+@app.post("/revokeAttestation", dependencies=[Depends(require_role("wallet_admin"))])
+async def revoke_attestation(address: str = Form(...), public_key_hex: str = Form(...)):
+    """Revoke a previously authorized VC signing key for an XRPL address."""
+    attestation.revoke_key(address.strip(), public_key_hex.strip())
+    return {"address": address, "registered_keys": sorted(attestation.lookup(address))}
+
+
+@app.get("/attestations/{address}")
+async def list_attestations(address: str):
+    """Return the set of VC signing keys authorized for an XRPL address."""
+    return {"address": address, "registered_keys": sorted(attestation.lookup(address))}
+
+
+@app.post("/deriveBbsProof")
+async def derive_bbs_proof(
+    file: UploadFile = File(...),
+    disclose: str = Form(...),
+    nonce: str = Form(...),
+):
+    """Prover side of BBS+ selective disclosure (paper Def. 8.4).
+
+    Upload a BBS+-anchored published file and a comma-separated `disclose` list of
+    leaf fingerprints (h_i) to reveal; tx_hash and the root R are always disclosed.
+    Returns a zero-knowledge proof revealing only the chosen messages, plus the
+    Merkle siblings needed for the verifier's condition-(ii) re-binding to R.
+    `nonce` is the verifier-supplied challenge (hex).
+    """
+    raw = await file.read()
+    parser = etree.XMLParser(remove_blank_text=True, ns_clean=True, recover=False)
+    try:
+        root = etree.fromstring(raw, parser=parser)
+    except etree.XMLSyntaxError:
+        raise HTTPException(status_code=400, detail="Uploaded file is not valid XML.")
+    message_ns = message_namespace(root)
+    header = root.find(f".//{{{message_ns}}}Header")
+    if header is None:
+        raise HTTPException(status_code=400, detail="<message:Header> not found in XML.")
+
+    embedded_vc = None
+    for src in find_anchor_sources(header, message_ns):
+        decoded = decode_vc_from_source_text((src.text or "").strip())
+        if decoded is not None:
+            embedded_vc = decoded
+            break
+    if embedded_vc is None or not is_bbs_vc(embedded_vc):
+        raise HTTPException(status_code=400, detail="File does not carry a BBS+ credential.")
+
+    subject = embedded_vc.get("credentialSubject", {})
+    tx_hash = subject.get("txHash", "")
+    merkle_root = subject.get("merkleRoot", "").upper()
+    leaves = [h.upper() for h in subject.get("leaves", [])]
+    messages = bbs_message_vector(tx_hash, merkle_root, leaves)  # [tx_hash, R, h1..hn]
+
+    disclose_leaves = {x.strip().upper() for x in disclose.split(",") if x.strip()}
+    # Always disclose tx_hash (index 0) and R (index 1); plus requested leaves.
+    disclosed_indices = [0, 1]
+    disclosed_leaf_indices = []
+    for i, h in enumerate(leaves):
+        if h in disclose_leaves:
+            disclosed_indices.append(2 + i)
+            disclosed_leaf_indices.append(i)
+
+    try:
+        pk = bbs.pk_from_hex(embedded_vc["proof"]["publicKeyHex"])
+        sig = embedded_vc["proof"]["signatureValue"]
+        nonce_bytes = bytes.fromhex(nonce)
+        proof = bbs.prove(pk, sig, messages, disclosed_indices, nonce_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error generating BBS+ proof: {e}")
+
+    # Condition (ii) support: Merkle inclusion proofs for each disclosed leaf so the
+    # verifier can re-bind disclosed leaves to R independently of the BBS+ key.
+    merkle_proofs = {}
+    for i in disclosed_leaf_indices:
+        p = merkle_inclusion_proof(leaves, i)
+        merkle_proofs[leaves[i]] = [{"sibling": s, "orientation": o} for s, o in p]
+
+    return {
+        "tx_hash": tx_hash,
+        "merkleRoot": merkle_root,
+        "leaves_count": len(leaves),
+        "publicKeyHex": embedded_vc["proof"]["publicKeyHex"],
+        "nonce": nonce,
+        "bbsProof": proof,
+        "merkleProofs": merkle_proofs,
+    }
+
+
+@app.post("/verifyBbsProof", response_model=ValidateResponse, responses={400: {"model": ErrorResponse}})
+async def verify_bbs_proof(
+    tx_hash: str = Form(...),
+    nonce: str = Form(...),
+    bbs_proof: str = Form(...),
+    merkle_proofs: str = Form("{}"),
+):
+    """Verifier side of BBS+ selective disclosure (paper Def. 8.4).
+
+    Checks (i) the BBS+ proof over the disclosed messages under the attested key,
+    and (ii) that each disclosed leaf re-binds to the on-chain root R via its
+    Merkle inclusion proof --- giving integrity independent of the BBS+ key.
+    """
+    try:
+        proof = json.loads(bbs_proof)
+        mproofs = json.loads(merkle_proofs) if merkle_proofs else {}
+        nonce_bytes = bytes.fromhex(nonce)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Malformed input: {e}")
+
+    # Fetch on-chain root R.
+    try:
+        tx_data = await fetch_transaction(tx_hash.strip())
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error fetching transaction {tx_hash}: {e}")
+    memos = tx_data.get("Memos") or tx_data.get("meta", {}).get("Memos") or []
+    if not memos:
+        return ValidateResponse(valid=False, reason="No memos found in the referenced transaction.")
+    memo_obj = memos[0].get("Memo", {}) if isinstance(memos[0], dict) else {}
+    memo_data = memo_obj.get("MemoData") or memo_obj.get("memo_data") or ""
+    memo_hash = memo_data.strip().upper()
+    on_chain_account = tx_data.get("Account")
+
+    disclosed_map = proof.get("disclosed", {})  # {index(str): message}
+    disclosed = {int(k): v for k, v in disclosed_map.items()}
+
+    # (i) BBS+ proof verification under the attested public key.
+    # The verifier reconstructs the attested key from the registry for this address.
+    pub_hex = None
+    for k in attestation.lookup(on_chain_account):
+        if len(k) == 384:  # BBS+ public keys are G2 points = 192 bytes = 384 hex chars
+            pub_hex = k
+            break
+    if pub_hex is None:
+        return ValidateResponse(valid=False, reason=f"No attested BBS+ key for on-chain address {on_chain_account}.")
+    try:
+        pk = bbs.pk_from_hex(pub_hex)
+        bbs_ok = bbs.proof_verify(pk, proof, disclosed, nonce_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error verifying BBS+ proof: {e}")
+    if not bbs_ok:
+        return ValidateResponse(valid=False, reason="BBS+ selective-disclosure proof is invalid.")
+
+    # Disclosed messages: index 0 = tx_hash, 1 = R, >=2 = leaves.
+    disclosed_tx = disclosed.get(0, "")
+    disclosed_root = disclosed.get(1, "").upper()
+    if disclosed_tx.lower() != tx_hash.strip().lower():
+        return ValidateResponse(valid=False, reason="Disclosed txHash does not match the referenced transaction.")
+    if disclosed_root != memo_hash:
+        return ValidateResponse(valid=False, reason=f"Disclosed root {disclosed_root} != on-chain root {memo_hash}.")
+
+    # (ii) Merkle re-binding: each disclosed leaf must open to R via its proof.
+    n = int(proof.get("L", 0)) - 2  # leaf count = message count - (tx_hash, R)
+    for idx, msg in disclosed.items():
+        if idx < 2:
+            continue
+        leaf_hash = msg.upper()
+        mp = mproofs.get(leaf_hash)
+        if not mp:
+            return ValidateResponse(valid=False, reason=f"Missing Merkle proof for disclosed leaf {leaf_hash}.")
+        pairs = [(p["sibling"].strip().upper(), p["orientation"].strip().upper()) for p in mp]
+        recomputed = root_from_inclusion_proof(leaf_hash, pairs, n)
+        if recomputed != memo_hash:
+            return ValidateResponse(valid=False, reason=f"Disclosed leaf {leaf_hash} does not re-bind to the on-chain root.")
+
+    return ValidateResponse(valid=True, reason="BBS+ selective-disclosure proof valid and disclosed leaves re-bind to the on-chain root.")
